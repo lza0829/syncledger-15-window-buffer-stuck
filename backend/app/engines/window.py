@@ -232,12 +232,14 @@ def _new_entry(
     align_key: dict[str, Any],
     row: dict[str, Any],
     window: WindowSpec,
-    clock: datetime,
     source_batch_id: int | None,
     source_buffer_id: int | None = None,
 ) -> dict[str, Any]:
     time_field = window.left_time_field if side == "left" else window.right_time_field
-    event_time = row_time(row, time_field) or clock
+    # Keep the row's own event time verbatim.  Never substitute the window's
+    # upper edge (or the observation clock) for it: the buffer ledger, the
+    # slide-past check and the audit trail all key off the real row time.
+    event_time = row_time(row, time_field)
     return {
         "buffer_id": source_buffer_id,
         "side": side,
@@ -448,6 +450,13 @@ def run_windowed(
         # Carried rows were buffered in an earlier pass, so they are eligible
         # for settlement in this one.
         entry.pop("fresh_this_pass", None)
+        # The row payload is the source of truth for its event time.  Re-anchor
+        # it so a buffer ledger written under an older (faulty) convention
+        # cannot keep a slid-past row alive.
+        time_field = window.left_time_field if entry["side"] == "left" else window.right_time_field
+        row_dt = row_time(entry.get("row") or {}, time_field)
+        if row_dt is not None:
+            entry["event_time"] = fmt_ts(row_dt)
         target = carried_left if entry["side"] == "left" else carried_right
         target[key] = entry
 
@@ -460,7 +469,7 @@ def run_windowed(
     def hold(
         side: str, key: str, align_key: dict[str, Any], row: dict[str, Any], *, is_fresh: bool
     ) -> dict[str, Any]:
-        entry = _new_entry(side, align_key, row, window, clock, None)
+        entry = _new_entry(side, align_key, row, window, None)
         # First observation of this side-only row: it must buffer, never be
         # finalised as side-only in the same pass.
         entry["fresh_this_pass"] = is_fresh

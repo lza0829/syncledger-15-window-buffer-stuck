@@ -139,6 +139,20 @@ def test_over_window_discard_rule_discards_and_counts_without_diff():
     assert second["settled"][0]["state"] == "discarded"
 
 
+def test_buffer_entry_keeps_row_event_time_not_window_edge():
+    """The buffered entry records the row's own timestamp, never the window edge."""
+    res = run(
+        [row("A", "2026-01-01T00:02:00Z", v=1)],
+        [],
+        window=W("2026-01-01T00:00:00Z", "2026-01-01T00:10:00Z", lateness=7200),
+        as_of="2026-01-01T00:09:00Z",
+    )
+    entry = res["buffer"][0]
+    assert entry["event_time"] == "2026-01-01T00:02:00Z"
+    assert entry["event_time"] != res["window"]["end"]
+    assert entry["event_time"] != res["as_of"]
+
+
 def test_advancing_window_upper_edge_liquidates_buffered_rows():
     first = run(
         [row("A", "2026-01-01T00:02:00Z", v=1)],
@@ -151,6 +165,22 @@ def test_advancing_window_upper_edge_liquidates_buffered_rows():
     c = second["counts"]
     assert c["buffered"] == 0, "row must not linger in buffer while missing from totals"
     assert c["left_only"] == 1
+    assert second["settled"][0]["reason"] == "window_slid_past_event"
+
+
+def test_stale_buffer_event_time_is_reanchored_to_row_time():
+    """A carried entry whose recorded event_time disagrees with the row payload
+    is re-anchored to the row: it must still be liquidated on a slide."""
+    first = run(
+        [row("A", "2026-01-01T00:02:00Z", v=1)],
+        [],
+        window=W("2026-01-01T00:00:00Z", "2026-01-01T00:10:00Z", lateness=7200),
+    )
+    poisoned = [dict(first["buffer"][0], event_time="2026-01-01T00:10:00Z")]
+    slid = W("2026-01-01T00:05:00Z", "2026-01-01T00:20:00Z", lateness=7200)
+    second = run([], [], poisoned, window=slid, as_of="2026-01-01T00:12:00Z")
+    assert second["counts"]["buffered"] == 0
+    assert second["counts"]["left_only"] == 1
     assert second["settled"][0]["reason"] == "window_slid_past_event"
 
 

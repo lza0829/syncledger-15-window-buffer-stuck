@@ -13,6 +13,23 @@ const form = reactive({
   right_time_field: 'updated_at',
   liquidation: 'finalize_side_only',
 })
+const asOf = ref('')
+const advancing = ref(false)
+
+function addSeconds(iso, seconds) {
+  if (!iso) return ''
+  const ms = Date.parse(iso)
+  if (Number.isNaN(ms)) return iso
+  return new Date(ms + seconds * 1000).toISOString().replace('.000Z', 'Z')
+}
+
+function windowWidth() {
+  const a = Date.parse(form.window_start)
+  const b = Date.parse(form.window_end)
+  if (Number.isNaN(a) || Number.isNaN(b) || b <= a) return 900
+  return Math.round((b - a) / 1000)
+}
+
 const buffer = ref([])
 const events = ref([])
 const batches = ref([])
@@ -39,6 +56,27 @@ const eventLabel = {
   buffer_superseded: '被新到达行替换',
   outside_window: '窗外未参与',
   not_arrived: '未到达本趟',
+}
+const eventTypeTag = {
+  buffer_entered: 'warn',
+  buffer_discarded: 'danger',
+  buffer_superseded: 'danger',
+  buffer_finalized: 'ok',
+  aligned_after_buffer: 'ok',
+}
+const reasonLabel = {
+  counterpart_not_arrived: '对侧未到',
+  counterpart_arrived_within_window: '对侧在窗内补到',
+  identical_rearrival: '同一行重复到达（保留原截止）',
+  buffer_deadline_elapsed: '时钟越过截止',
+  window_slid_past_event: '窗口上沿已滑过事件时间',
+  fresh_arrival_replaced_buffered_row: '新到达行替换旧缓冲',
+  timestamp_missing: '行缺时间戳',
+  timestamp_outside_window: '时间戳在窗外',
+  timestamp_after_observation_clock: '时间戳晚于观测时钟',
+}
+function reasonText(r) {
+  return r ? (reasonLabel[r] || r) : '—'
 }
 
 function secs(v) {
@@ -122,12 +160,79 @@ async function runPass() {
       left_time_field: form.left_time_field,
       right_time_field: form.right_time_field,
       liquidation: form.liquidation,
+      as_of: asOf.value || null,
     })
     await refreshAll()
   } catch (e) {
     err.value = String(e.message || e)
   } finally {
     busyRun.value = false
+  }
+}
+
+async function makeBuffer() {
+  if (!pairId.value) return
+  busyRun.value = true
+  err.value = ''
+  notice.value = ''
+  try {
+    // Observation clock just past the window's lower edge: rows that have not
+    // arrived by then stay side-only and enter the auditable buffer.
+    asOf.value = addSeconds(form.window_start, 30)
+    last.value = await postJSON('/api/reconcile', {
+      pair_id: Number(pairId.value),
+      note: '窗口对账 · 先做出缓冲',
+      window_start: form.window_start,
+      window_end: form.window_end,
+      max_lateness_seconds: Number(form.max_lateness_seconds),
+      left_time_field: form.left_time_field,
+      right_time_field: form.right_time_field,
+      liquidation: form.liquidation,
+      as_of: asOf.value,
+    })
+    notice.value = `第 1 趟完成：缓冲 ${last.value.counts.buffered} 条（事件时间见缓冲账本）。`
+    await refreshAll()
+  } catch (e) {
+    err.value = String(e.message || e)
+  } finally {
+    busyRun.value = false
+  }
+}
+
+async function advanceUpperEdge() {
+  if (!pairId.value) return
+  advancing.value = true
+  err.value = ''
+  notice.value = ''
+  try {
+    // Slide the window forward by exactly one width: the new lower edge is the
+    // old upper edge, so buffered rows whose event time is before it are
+    // over-window and must be liquidated by the pair's rule.
+    const width = windowWidth()
+    const start = form.window_end
+    const end = addSeconds(form.window_end, width)
+    asOf.value = addSeconds(start, 5 * 60)
+    last.value = await postJSON('/api/reconcile', {
+      pair_id: Number(pairId.value),
+      note: '窗口对账 · 推进窗口上沿',
+      window_start: start,
+      window_end: end,
+      max_lateness_seconds: Number(form.max_lateness_seconds),
+      left_time_field: form.left_time_field,
+      right_time_field: form.right_time_field,
+      liquidation: form.liquidation,
+      as_of: asOf.value,
+    })
+    form.window_start = start
+    form.window_end = end
+    notice.value =
+      `第 2 趟完成：窗口推进到 [${start}, ${end})，缓冲 ${last.value.counts.buffered} 条，` +
+      `清算逾窗 ${last.value.counts.expired_total} 条，丢弃 ${last.value.counts.discarded} 条。`
+    await refreshAll()
+  } catch (e) {
+    err.value = String(e.message || e)
+  } finally {
+    advancing.value = false
   }
 }
 
@@ -205,6 +310,9 @@ watch(pairId, async () => {
             <option value="discard">显式丢弃并计数</option>
           </select>
         </label>
+        <label>观测时钟（可选）
+          <input v-model="asOf" class="mono" placeholder="2026-11-12T08:00:30Z" />
+        </label>
       </div>
       <p class="muted" style="margin:0.6rem 0 0">
         缓冲截止 = 窗口上沿 + 允许迟到（{{ secs(form.max_lateness_seconds) }}）。
@@ -215,8 +323,19 @@ watch(pairId, async () => {
         <button class="secondary" :disabled="busyRun || !pairId" @click="runPass">
           {{ busyRun ? '抽取中…' : '按当前窗口跑一趟' }}
         </button>
+        <button class="secondary" :disabled="busyRun || !pairId" @click="makeBuffer">
+          {{ busyRun ? '抽取中…' : '① 先做出缓冲（时钟贴近下沿）' }}
+        </button>
+        <button class="secondary" :disabled="advancing || !pairId" @click="advanceUpperEdge">
+          {{ advancing ? '推窗中…' : '② 推进窗口上沿并清算' }}
+        </button>
         <router-link v-if="last" :to="{ path: '/diffs', query: { batch_id: last.id } }">查看本批差异 →</router-link>
       </div>
+      <p class="muted" style="margin:0.5rem 0 0">
+        推荐走势：先「① 先做出缓冲」，再看缓冲账本里各行的<strong>事件时间</strong>；
+        然后「② 推进窗口上沿」按一个窗宽滑窗，事件时间落在新下沿之前的行必须清算，
+        缓冲归零并与本趟计数、事件账互证。
+      </p>
     </div>
 
     <div class="panel" v-if="last">
@@ -262,7 +381,7 @@ watch(pairId, async () => {
             <td class="mono">{{ b.deadline }}</td>
             <td><span class="tag warn">buffered</span></td>
             <td>{{ b.entered_batch_id || '—' }}</td>
-            <td class="muted">{{ b.settled_reason || '—' }}</td>
+            <td class="muted">{{ reasonText(b.settled_reason) }}</td>
           </tr>
           <tr v-if="!activeBuffer.length"><td colspan="7" class="muted">缓冲为空。</td></tr>
         </tbody>
@@ -281,7 +400,7 @@ watch(pairId, async () => {
             <td class="mono">{{ b.deadline }}</td>
             <td><span class="tag" :class="b.state === 'discarded' || b.state === 'superseded' ? 'danger' : 'ok'">{{ b.state }}</span></td>
             <td>{{ b.settled_batch_id || '—' }}</td>
-            <td class="muted mono">{{ b.settled_reason || '—' }}</td>
+            <td class="muted">{{ reasonText(b.settled_reason) }}</td>
           </tr>
           <tr v-if="!closedBuffer.length"><td colspan="7" class="muted">暂无已结算记录。</td></tr>
         </tbody>
@@ -340,12 +459,12 @@ watch(pairId, async () => {
         <tbody>
           <tr v-for="e in events.slice(0, 40)" :key="e.id">
             <td>{{ e.batch_id }}</td>
-            <td><span class="tag" :class="e.event_type === 'buffer_entered' ? 'warn' : (e.event_type === 'aligned_after_buffer' ? 'ok' : '')">{{ eventLabel[e.event_type] || e.event_type }}</span></td>
+            <td><span class="tag" :class="eventTypeTag[e.event_type] || ''">{{ eventLabel[e.event_type] || e.event_type }}</span></td>
             <td>{{ e.side === 'left' ? '左端' : '右端' }}</td>
             <td class="mono">{{ JSON.stringify(e.align_key) }}</td>
             <td class="mono">{{ e.event_time || '—' }}</td>
             <td class="mono">{{ e.deadline || '—' }}</td>
-            <td class="muted">{{ e.reason || '—' }}</td>
+            <td class="muted">{{ reasonText(e.reason) }}</td>
           </tr>
           <tr v-if="!events.length"><td colspan="7" class="muted">暂无缓冲事件。</td></tr>
         </tbody>

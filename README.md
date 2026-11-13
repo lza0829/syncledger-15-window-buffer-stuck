@@ -32,7 +32,8 @@ docker compose up --build
 与审计摘要三处计数一致。
 
 页面：`/window`「窗口缓冲」可配置窗口/迟到/时间字段/逾窗规则，查看缓冲账本与缓冲事件
-审计，并一键演示四种走势：
+审计；面板上「① 先做出缓冲」→「② 推进窗口上沿并清算」可按页面对照缓冲列表（行真实事件
+时间）、本趟计数与清算事件，另有四种一键演示走势：
 
 | 演示 | 走势 |
 | --- | --- |
@@ -47,7 +48,7 @@ docker compose up --build
 `left_time_field` / `right_time_field` / `liquidation` / `as_of`，`use_window=false` 回退到
 全量快照口径。
 
-测试：`cd backend && pytest`（引擎语义 + 持久化/API 集成，共 26 条）。
+测试：`cd backend && pytest`（引擎语义 + 持久化/API 集成，共 28 条）。
 
 ## 种子对账对
 

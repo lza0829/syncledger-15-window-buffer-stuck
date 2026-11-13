@@ -105,6 +105,15 @@ def test_slide_window_upper_edge_liquidates_stale_buffer(client):
         as_of="2026-11-12T08:12:00Z",
     )
     assert first["counts"]["buffered"] == 2
+    # The ledger keeps the rows' real event times, not the window's upper edge.
+    buffered = active_buffer(client)
+    assert {b["event_time"] for b in buffered} == {
+        "2026-11-12T08:10:00Z",
+        "2026-11-12T08:12:00Z",
+    }
+    assert all(b["window_end"] == "2026-11-12T08:15:00Z" for b in buffered)
+    assert all(b["event_time"] != b["window_end"] for b in buffered)
+
     slid = run(
         client,
         window_start="2026-11-12T08:15:00Z",
@@ -113,8 +122,44 @@ def test_slide_window_upper_edge_liquidates_stale_buffer(client):
         as_of="2026-11-12T08:20:00Z",
     )
     c = slid["counts"]
-    assert "buffered" in c
-    assert isinstance(active_buffer(client), list)
+    assert c["buffered"] == 0 and c["buffered_left"] == 0 and c["buffered_right"] == 0
+    assert c["expired_left"] == 1 and c["expired_right"] == 1
+    assert c["expired_total"] == 2
+    assert c["left_only"] == 1 and c["right_only"] == 1
+    assert c["diff_total"] == 2
+    assert active_buffer(client) == [], "slid-past rows must not linger in the buffer"
+
+    # Terminal diffs carry the real row times and the expired-from-buffer mark.
+    diffs = client.get("/api/diffs", params={"batch_id": slid["id"]}).json()
+    expired = [d for d in diffs if d["origin"] == "window_expired"]
+    assert len(expired) == 2 == c["expired_total"]
+    assert all(d["expired_from_buffer"] == 1 for d in expired)
+    assert {d["event_time"] for d in expired} == {
+        "2026-11-12T08:10:00Z",
+        "2026-11-12T08:12:00Z",
+    }
+
+    # Settlement is audited on the batch and its reason names the slide.
+    events = client.get("/api/buffer/events", params={"batch_id": slid["id"]}).json()
+    finalised = [e for e in events if e["event_type"] == "buffer_finalized"]
+    assert len(finalised) == 2
+    assert all(e["reason"] == "window_slid_past_event" for e in finalised)
+    assert all(e["buffer_id"] is not None for e in finalised)
+    assert {e["event_time"] for e in finalised} == {d["event_time"] for d in expired}
+
+    # Closed ledger rows agree with the settled events.
+    closed = client.get(
+        "/api/buffer", params={"pair_id": 1, "state": "finalized"}
+    ).json()
+    assert len(closed) == 2
+    assert {b["settled_batch_id"] for b in closed} == {slid["id"]}
+    assert all(b["settled_reason"] == "window_slid_past_event" for b in closed)
+
+    audit = client.get(f"/api/audit/batches/{slid['id']}").json()
+    assert audit["counts"]["buffered"] == c["buffered"] == 0
+    assert len(audit["active_buffer_now"]) == 0
+    assert len(diffs) == c["diff_total"]
+    assert sum(1 for d in diffs if d["origin"] == "window_expired") == c["expired_total"]
 
 
 def test_discard_rule_removes_buffer_and_counts(client):
@@ -208,7 +253,7 @@ def test_buffered_rows_never_counted_in_terminal_diff_total(client):
     [
         ("buffer_then_align", {"p0_buffered": 2, "p1_diff": 1, "p1_buffered": 0}),
         ("expire_side_only", {"p0_buffered": 2, "p1_diff": 3, "p1_buffered": 0}),
-        ("slide_window_clears_buffer", {"p0_buffered": 2, "p1_diff": None, "p1_buffered": None}),
+        ("slide_window_clears_buffer", {"p0_buffered": 2, "p1_diff": 2, "p1_buffered": 0}),
         ("discard_over_window", {"p0_buffered": 2, "p1_diff": 1, "p1_buffered": 0}),
     ],
 )

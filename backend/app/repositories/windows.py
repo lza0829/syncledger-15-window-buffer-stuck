@@ -141,10 +141,18 @@ def buffer_enter(
     row_json = json.dumps(row, ensure_ascii=False, sort_keys=True)
     existing = _find_active(conn, pair_id, side, align_key_json)
     if existing is not None and existing["row_json"] == row_json:
-        conn.execute(
-            "UPDATE reconcile_buffer SET updated_at=? WHERE id=?",
-            (now, existing["id"]),
-        )
+        # Identical re-seen row: keep the original deadline, but re-anchor a
+        # ledger event_time that disagrees with the row's real timestamp.
+        if event_time is not None and existing["event_time"] != event_time:
+            conn.execute(
+                "UPDATE reconcile_buffer SET event_time=?, updated_at=? WHERE id=?",
+                (event_time, now, existing["id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE reconcile_buffer SET updated_at=? WHERE id=?",
+                (now, existing["id"]),
+            )
         return int(existing["id"]), False
     if existing is not None:
         # Changed payload: close the old copy as superseded (counted by the
@@ -170,7 +178,7 @@ def buffer_enter(
             side,
             align_key_json,
             row_json,
-            window_end,
+            event_time,
             deadline,
             window_start,
             window_end,
